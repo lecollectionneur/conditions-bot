@@ -2,18 +2,28 @@ import os
 import random
 import re
 from datetime import timedelta
+from pathlib import Path
 
 import discord
-from anthropic import AsyncAnthropic
+from google import genai
+from google.genai import types
 from discord import app_commands
 from dotenv import load_dotenv
 
-load_dotenv()
+ENV_PATH = Path(__file__).resolve().with_name(".env")
+load_dotenv(ENV_PATH, encoding="utf-8-sig")
 TOKEN = os.getenv("DISCORD_TOKEN")
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")  # "claude-haiku-5-5" = moins cher
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 AUTO_CHANNEL_ID = int(os.getenv("AUTO_CHANNEL_ID", "0"))  # salon où le bot répond sans mention (optionnel)
 
-ai = AsyncAnthropic()  # lit ANTHROPIC_API_KEY dans l'environnement
+if not os.getenv("GEMINI_API_KEY"):
+    raise SystemExit(
+        "GEMINI_API_KEY introuvable.\n"
+        f"Fichier .env cherché : {ENV_PATH}\n"
+        f"Ce fichier existe : {ENV_PATH.exists()}\n"
+        "Il doit contenir une ligne : GEMINI_API_KEY=ta_cle (sans guillemets ni espaces)."
+    )
+ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 NO_PING = discord.AllowedMentions.none()
 
 # ----------------------------------------------------------------------------
@@ -320,7 +330,7 @@ TOOLS = [
     {
         "name": "kick_member",
         "description": "Expulse un membre du serveur (il peut revenir).",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"member": MEMBER_PROP, "reason": REASON_PROP},
             "required": ["member"],
@@ -329,7 +339,7 @@ TOOLS = [
     {
         "name": "ban_member",
         "description": "Bannit un membre du serveur.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"member": MEMBER_PROP, "reason": REASON_PROP},
             "required": ["member"],
@@ -338,7 +348,7 @@ TOOLS = [
     {
         "name": "unban_user",
         "description": "Débannit un utilisateur à partir de son ID numérique.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"user_id": {"type": "string"}, "reason": REASON_PROP},
             "required": ["user_id"],
@@ -347,11 +357,11 @@ TOOLS = [
     {
         "name": "timeout_member",
         "description": "Exclut temporairement (mute) un membre pour une durée en minutes (1 à 40320).",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "member": MEMBER_PROP,
-                "minutes": {"type": "integer", "minimum": 1, "maximum": 40320},
+                "minutes": {"type": "integer"},
                 "reason": REASON_PROP,
             },
             "required": ["member", "minutes"],
@@ -360,7 +370,7 @@ TOOLS = [
     {
         "name": "untimeout_member",
         "description": "Retire l'exclusion temporaire d'un membre.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"member": MEMBER_PROP},
             "required": ["member"],
@@ -369,9 +379,9 @@ TOOLS = [
     {
         "name": "clear_messages",
         "description": "Supprime les derniers messages du salon actuel (1 à 100).",
-        "input_schema": {
+        "parameters": {
             "type": "object",
-            "properties": {"amount": {"type": "integer", "minimum": 1, "maximum": 100}},
+            "properties": {"amount": {"type": "integer"}},
             "required": ["amount"],
         },
     },
@@ -460,29 +470,30 @@ async def handle_chat(message: discord.Message, texte: str):
     contexte += "]\n"
 
     hist = history.setdefault(message.channel.id, [])
-    kwargs = {}
+    tools = None
     if is_moderator(message.author):  # les non-modérateurs ne peuvent que discuter
-        kwargs["tools"] = TOOLS
+        tools = [types.Tool(function_declarations=[types.FunctionDeclaration(**t) for t in TOOLS])]
+    config = types.GenerateContentConfig(system_instruction=SYSTEM, tools=tools)
+    contents = [
+        types.Content(
+            role="model" if h["role"] == "assistant" else "user",
+            parts=[types.Part.from_text(text=h["content"])],
+        )
+        for h in hist[-8:] + [{"role": "user", "content": contexte + texte}]
+    ]
 
     async with message.channel.typing():
         try:
-            resp = await ai.messages.create(
-                model=MODEL,
-                max_tokens=800,
-                system=SYSTEM,
-                messages=hist[-8:] + [{"role": "user", "content": contexte + texte}],
-                **kwargs,
-            )
+            resp = await ai.aio.models.generate_content(model=MODEL, contents=contents, config=config)
         except Exception as e:
-            print("Erreur API Claude :", e)
+            print("Erreur API Gemini :", e)
             await message.channel.send("😵 Je n'arrive pas à réfléchir pour le moment, réessaie plus tard.")
             return
 
-        reponse = "".join(b.text for b in resp.content if b.type == "text").strip()
+        reponse = (resp.text or "").strip()
         resultats = []
-        for block in resp.content:
-            if block.type == "tool_use":
-                resultats.append(await run_tool(message, block.name, block.input))
+        for call in resp.function_calls or []:
+            resultats.append(await run_tool(message, call.name, dict(call.args or {})))
 
     sortie = "\n".join(x for x in [reponse, *resultats] if x) or "👍"
     hist.append({"role": "user", "content": contexte + texte})
