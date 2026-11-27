@@ -8,6 +8,7 @@ and do "python bot.py" in the terminal to launch the bot !
 here the link to add the bot to your discord : https://discord.com/oauth2/authorize?client_id=1477303711914131516
 ---
 here the commands :
+
 Utilities
 
 /ping: shows the bot's latency
