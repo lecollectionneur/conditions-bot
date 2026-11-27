@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import re
@@ -7,14 +8,15 @@ from pathlib import Path
 
 import discord
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from discord import app_commands
 from dotenv import load_dotenv
 
 ENV_PATH = Path(__file__).resolve().with_name(".env")
 load_dotenv(ENV_PATH, encoding="utf-8-sig")
 TOKEN = os.getenv("DISCORD_TOKEN")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")  # modèle de secours
 AUTO_CHANNEL_ID = int(os.getenv("AUTO_CHANNEL_ID", "0"))  # salon où le bot répond sans mention (optionnel)
 
 if not os.getenv("GEMINI_API_KEY"):
@@ -499,6 +501,23 @@ def remember(key: int, user_text: str, assistant_text: str):
     del hist[:-24]
 
 
+async def generate_with_retry(contents, config):
+    """Réessaie si Google est surchargé (503/429...), puis bascule sur le modèle de secours."""
+    essais = [(MODEL, 0), (MODEL, 2), (FALLBACK_MODEL, 0), (FALLBACK_MODEL, 3)]
+    derniere = None
+    for modele, pause in essais:
+        if pause:
+            await asyncio.sleep(pause)
+        try:
+            return await ai.aio.models.generate_content(model=modele, contents=contents, config=config)
+        except errors.APIError as e:
+            derniere = e
+            print(f"Gemini ({modele}) : erreur {e.code}, nouvel essai...")
+            if e.code not in (429, 500, 503, 504):
+                raise
+    raise derniere
+
+
 async def ask_gemini(guild_id, key: int, contexte: str, texte: str, images: list, tools=None):
     systeme = SYSTEM
     if guild_id in personas:
@@ -514,7 +533,7 @@ async def ask_gemini(guild_id, key: int, contexte: str, texte: str, images: list
     contents.append(
         types.Content(role="user", parts=[types.Part.from_text(text=contexte + texte), *images])
     )
-    resp = await ai.aio.models.generate_content(model=MODEL, contents=contents, config=config)
+    resp = await generate_with_retry(contents, config)
     return (resp.text or "").strip(), list(resp.function_calls or [])
 
 
@@ -558,7 +577,7 @@ async def handle_chat(message: discord.Message, texte: str, images: list):
             )
         except Exception as e:
             print("Erreur API Gemini :", e)
-            await message.channel.send("😵 Je n'arrive pas à réfléchir pour le moment, réessaie plus tard.")
+            await message.channel.send("😵 Je n'arrive pas à réfléchir pour le moment (détails dans la console du bot).")
             return
         resultats = []
         for appel in appels:
@@ -583,7 +602,7 @@ async def ia(interaction: discord.Interaction, question: str, prive: bool = True
         reponse, _ = await ask_gemini(interaction.guild_id, cle, contexte, question, [])
     except Exception as e:
         print("Erreur API Gemini :", e)
-        await interaction.followup.send("😵 Je n'arrive pas à réfléchir pour le moment, réessaie plus tard.", ephemeral=True)
+        await interaction.followup.send("😵 Je n'arrive pas à réfléchir pour le moment (détails dans la console du bot).", ephemeral=True)
         return
     reponse = reponse or "🤔 Je n'ai pas pu répondre, reformule ta question."
     remember(cle, contexte + question, reponse)
